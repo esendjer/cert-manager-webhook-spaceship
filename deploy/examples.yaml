@@ -1,0 +1,41 @@
+# Example usage. Edit the e-mail and domains, then apply.
+# Use the staging directory URL while testing to avoid Let's Encrypt rate limits:
+#   https://acme-staging-v02.api.letsencrypt.org/directory
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: letsencrypt-spaceship
+spec:
+  acme:
+    server: https://acme-v02.api.letsencrypt.org/directory
+    email: your-email@example.com
+    privateKeySecretRef:
+      name: letsencrypt-spaceship-account-key
+    solvers:
+      - dns01:
+          webhook:
+            groupName: dns01.spaceship.webhook
+            solverName: spaceship
+            config:
+              ttl: 300
+---
+# Example Certificate (adjust or remove).
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: exapmple-com
+spec:
+  secretName: example-com-tls
+  commonName: example-com
+  dnsNames:
+    - example.com
+    - "*.example.com"
+  issuerRef:
+    name: letsencrypt-spaceship
+    kind: Issuer
+  secretTemplate:
+    annotations:
+      reflector.v1.k8s.emberstack.com/reflection-allowed: "true"
+      reflector.v1.k8s.emberstack.com/reflection-allowed-namespaces: ""  # Control destination namespaces
+      reflector.v1.k8s.emberstack.com/reflection-auto-enabled: "true" # Auto create reflection for matching namespaces
+      reflector.v1.k8s.emberstack.com/reflection-auto-namespaces: "" # Control auto-reflection namespaces

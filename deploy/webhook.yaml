@@ -1,0 +1,222 @@
+# cert-manager DNS-01 webhook solver for Spaceship DNS.
+#
+# Prerequisites (see README.md):
+#   - cert-manager (with cainjector) installed in the "cert-manager" namespace
+#   - Secret "spaceship-credentials" created in that namespace
+#   - the SPACESHIP_IMAGE_REF variable set (applied via envsubst, see README.md)
+#
+# "dns01.spaceship.webhook" is only an API group identifier shared by the
+# APIService, the ClusterRole and the ClusterIssuers. It is unrelated to the
+# domains you manage; one solver serves every zone your Spaceship account owns.
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: spaceship-webhook
+  namespace: cert-manager
+---
+# Let the webhook delegate authn/authz of incoming requests to the kube-apiserver.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: spaceship-webhook:auth-delegator
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: system:auth-delegator
+subjects:
+  - kind: ServiceAccount
+    name: spaceship-webhook
+    namespace: cert-manager
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: spaceship-webhook:authentication-reader
+  namespace: kube-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: extension-apiserver-authentication-reader
+subjects:
+  - kind: ServiceAccount
+    name: spaceship-webhook
+    namespace: cert-manager
+---
+# Allow cert-manager to call the solver resource.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: spaceship-webhook:domain-solver
+rules:
+  - apiGroups: ["dns01.spaceship.webhook"]
+    resources: ["spaceship"]
+    verbs: ["create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: spaceship-webhook:domain-solver
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: spaceship-webhook:domain-solver
+subjects:
+  - kind: ServiceAccount
+    name: cert-manager
+    namespace: cert-manager
+---
+# Private PKI for the webhook's serving certificate.
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: spaceship-webhook-selfsign
+  namespace: cert-manager
+spec:
+  selfSigned: {}
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: spaceship-webhook-ca
+  namespace: cert-manager
+spec:
+  isCA: true
+  commonName: spaceship-webhook-ca
+  secretName: spaceship-webhook-ca
+  duration: 43800h
+  privateKey:
+    algorithm: ECDSA
+    size: 256
+  issuerRef:
+    name: spaceship-webhook-selfsign
+    kind: Issuer
+---
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: spaceship-webhook-ca
+  namespace: cert-manager
+spec:
+  ca:
+    secretName: spaceship-webhook-ca
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: spaceship-webhook-tls
+  namespace: cert-manager
+spec:
+  secretName: spaceship-webhook-tls
+  duration: 8760h
+  renewBefore: 720h
+  dnsNames:
+    - spaceship-webhook
+    - spaceship-webhook.cert-manager
+    - spaceship-webhook.cert-manager.svc
+  privateKey:
+    algorithm: ECDSA
+    size: 256
+  issuerRef:
+    name: spaceship-webhook-ca
+    kind: Issuer
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: spaceship-webhook
+  namespace: cert-manager
+  labels:
+    app.kubernetes.io/name: spaceship-webhook
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: spaceship-webhook
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: spaceship-webhook
+    spec:
+      imagePullSecrets:
+        - name: regcred
+      serviceAccountName: spaceship-webhook
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: webhook
+          image: ${SPACESHIP_IMAGE_REF}
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: https
+              containerPort: 8443
+          env:
+            - name: SOLVER_NAME
+              value: spaceship
+          envFrom:
+            - secretRef:
+                name: spaceship-credentials
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: https
+              scheme: HTTPS
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: https
+              scheme: HTTPS
+            initialDelaySeconds: 5
+          resources:
+            requests:
+              cpu: 20m
+              memory: 64Mi
+            limits:
+              memory: 128Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: tls
+              mountPath: /tls
+              readOnly: true
+      volumes:
+        - name: tls
+          secret:
+            secretName: spaceship-webhook-tls
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: spaceship-webhook
+  namespace: cert-manager
+spec:
+  selector:
+    app.kubernetes.io/name: spaceship-webhook
+  ports:
+    - name: https
+      port: 443
+      targetPort: https
+---
+# Registers the aggregated API; cainjector fills in caBundle from the serving cert.
+apiVersion: apiregistration.k8s.io/v1
+kind: APIService
+metadata:
+  name: v1alpha1.dns01.spaceship.webhook
+  annotations:
+    cert-manager.io/inject-ca-from: cert-manager/spaceship-webhook-tls
+spec:
+  group: dns01.spaceship.webhook
+  version: v1alpha1
+  groupPriorityMinimum: 1000
+  versionPriority: 15
+  service:
+    name: spaceship-webhook
+    namespace: cert-manager
+    port: 443
